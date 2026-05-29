@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta name="game-uuid" content="838a1123-25a5-4c54-a065-32b236f039d7" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#040208" />
+  <link rel="icon" type="image/gif" href="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" />
+  <title>Ferrofluid</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@1,500&family=Inter:wght@400;600&display=swap" rel="stylesheet" />
+  <style>
+    * {
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-touch-callout: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    html, body {
+      margin: 0; padding: 0; width: 100%; height: 100%;
+      background: #040208;
+      color: #fff;
+      overflow: hidden;
+      touch-action: none;
+      overscroll-behavior: none;
+    }
+    /* No in-game border-radius: Aigram host already wraps the game with a rounded
+       frame, so adding one here would double-round and clip overflowing chrome. */
+    body { position: relative; }
+    #stage {
+      position: absolute; inset: 0;
+      display: block;
+      width: 100%; height: 100%;
+      background: #040208;
+    }
+
+    .wm {
+      position: absolute;
+      top: max(16px, env(safe-area-inset-top));
+      left: 18px;
+      width: 64px;
+      height: auto;
+      opacity: 0.62;
+      pointer-events: none;
+      z-index: 4;
+      filter: drop-shadow(0 1px 3px rgba(0,0,0,0.5));
+    }
+
+    .title {
+      position: absolute;
+      top: max(20px, env(safe-area-inset-top));
+      left: 50%;
+      transform: translateX(-50%);
+      font-family: "Cormorant Garamond", serif;
+      font-style: italic;
+      font-weight: 500;
+      font-size: 26px;
+      letter-spacing: 0.02em;
+      color: rgba(245, 177, 199, 0.78);
+      pointer-events: none;
+      z-index: 4;
+      text-shadow: 0 1px 6px rgba(245,177,199,0.18);
+    }
+
+    .hint {
+      position: absolute;
+      left: 50%;
+      top: 28%;
+      transform: translate(-50%, -50%);
+      font-family: "Inter", sans-serif;
+      font-weight: 400;
+      font-size: 13px;
+      letter-spacing: 0.34em;
+      text-transform: uppercase;
+      color: rgba(245, 177, 199, 0.55);
+      pointer-events: none;
+      z-index: 4;
+      animation: ferro-hint 2.4s ease-in-out infinite;
+      transition: opacity 1.6s ease;
+    }
+    .hint.is-gone { opacity: 0; }
+
+    @keyframes ferro-hint {
+      0%, 100% { opacity: 0.32; }
+      50%      { opacity: 0.72; }
+    }
+
+    /* Subtle vignette layered above canvas — adds depth without bleeding into the metal */
+    .vignette {
+      position: absolute; inset: 0;
+      pointer-events: none;
+      z-index: 2;
+      background: radial-gradient(ellipse at 50% 56%, transparent 50%, rgba(0,0,0,0.42) 100%);
+    }
+  </style>
+</head>
+<body>
+  <canvas id="stage"></canvas>
+  <div class="vignette"></div>
+  <img class="wm" src="./alteru.svg" alt="AlterU" />
+  <div class="title">ferrofluid</div>
+  <div class="hint" id="hint">drag the pool</div>
+
+  <script id="vs" type="x-shader/x-vertex">
+    attribute vec2 a_pos;
+    void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }
+  </script>
+
+  <script id="fs" type="x-shader/x-fragment">
+    precision highp float;
+
+    #define N_SPIKES 10
+
+    uniform vec2  u_res;
+    uniform float u_time;
+    uniform float u_breath;
+    uniform vec2  u_spikes[N_SPIKES];
+    uniform float u_spikePower[N_SPIKES];
+    uniform float u_baseY;
+    uniform float u_pulse;     // 0-1 global activity used for color saturation
+
+    float smin(float a, float b, float k) {
+      float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+      return mix(b, a, h) - k * h * (1.0 - h);
+    }
+
+    float poolBaseline(float x) {
+      float b = u_baseY;
+      b -= sin(x * 0.0085 + u_time * 0.32) * 3.6 * (0.45 + u_breath * 0.55);
+      b -= sin(x * 0.022  - u_time * 0.71) * 1.4;
+      b -= sin(x * 0.005  + u_time * 0.18) * 1.8;
+      return b;
+    }
+
+    float sdPool(vec2 p) {
+      // SDF convention: negative inside the metal. Pool body fills the bottom
+      // of the screen — pixels with p.y > baseline are inside.
+      float d = poolBaseline(p.x) - p.y;
+      for (int i = 0; i < N_SPIKES; i++) {
+        vec2  tip   = u_spikes[i];
+        float power = u_spikePower[i];
+        vec2  root  = vec2(tip.x, poolBaseline(tip.x));
+        vec2  pa = p - root;
+        vec2  ba = tip - root;
+        float baLen2 = dot(ba, ba) + 1e-3;
+        float h = clamp(dot(pa, ba) / baLen2, 0.0, 1.0);
+        // Tapered radius: wider at base, narrow at tip; sharper with more power
+        float rBase = 22.0 + power * 6.0;
+        float rTip  = 3.8  + (1.0 - power) * 5.0;
+        float r = mix(rBase, rTip, h);
+        float capD = length(pa - ba * h) - r;
+        d = smin(d, capD, 16.0 - power * 4.0);
+      }
+      return d;
+    }
+
+    void main() {
+      vec2 p = vec2(gl_FragCoord.x, u_res.y - gl_FragCoord.y);
+      float d = sdPool(p);
+
+      // Background — deep cosmic gradient
+      vec2  center = vec2(u_res.x * 0.5, u_res.y * 0.4);
+      float r = length((p - center) / u_res.y);
+      vec3  bg = mix(vec3(0.038, 0.022, 0.060), vec3(0.012, 0.006, 0.022), smoothstep(0.0, 0.95, r));
+      // subtle warm pink ember near horizon
+      bg += vec3(0.10, 0.04, 0.07) * smoothstep(u_baseY + 80.0, u_baseY - 20.0, p.y) * 0.25;
+
+      vec3 col = bg;
+
+      if (d < 0.0) {
+        // Distance falloffs (d is more negative deeper in the metal)
+        float rim     = smoothstep(-2.5, 0.0, d);   // bright knife edge, top 2.5px
+        float surface = smoothstep(-14.0, -1.0, d); // surface band, top 14px
+        float belly   = 1.0 - smoothstep(-40.0, -8.0, d); // 1 deep in belly, 0 near surface
+
+        // Vertical brightness — tips read silver, belly reads obsidian
+        float verticalTip = clamp((u_baseY + 14.0 - p.y) / (u_res.y * 0.36), 0.0, 1.0);
+
+        vec3 chromeBase = vec3(0.008, 0.006, 0.014);    // nearly black, slight cool tint
+        vec3 chromeSurf = vec3(0.18, 0.16, 0.22);       // mid silver near surface
+        vec3 chromeRim  = vec3(0.92, 0.90, 0.98);       // bright silver knife edge
+
+        col = chromeBase;
+        col = mix(col, chromeSurf, surface * (0.55 + 0.45 * verticalTip));
+        col = mix(col, chromeRim,  rim     * (0.60 + 0.40 * verticalTip));
+
+        // Faint slow banding in the deep belly — barely-there reflection hint
+        float band = sin(p.y * 0.013 - u_time * 0.28) * 0.5 + 0.5;
+        col += vec3(0.030, 0.025, 0.040) * band * belly * 0.55;
+
+        // AlterU pink fresnel on outer band — strongest on tips
+        float pinkBand = smoothstep(-10.0, -1.5, d) * (1.0 - smoothstep(-1.5, 0.0, d));
+        col += vec3(0.96, 0.69, 0.78) * pinkBand * (0.25 + 0.65 * verticalTip);
+
+        // Purple peak glow on the very tips
+        float peak = smoothstep(0.74, 1.0, verticalTip);
+        col += vec3(0.47, 0.0, 0.63) * peak * rim * 0.65;
+        col += vec3(1.0, 0.86, 0.94) * peak * rim * 0.4;
+
+      } else {
+        // Outside: subtle glow halo from spike tips
+        float glow = 0.0;
+        for (int i = 0; i < N_SPIKES; i++) {
+          vec2  tip = u_spikes[i];
+          float pw  = u_spikePower[i];
+          float dd  = length(p - tip);
+          glow += pw * 14.0 / (dd * dd + 32.0);
+        }
+        col += vec3(0.96, 0.69, 0.78) * glow * 0.55;
+        col += vec3(0.47, 0.0, 0.63) * glow * 0.32;
+      }
+
+      // Global pulse — when toy is being touched, the world breathes slightly warmer
+      col = mix(col, col * vec3(1.05, 0.92, 1.02), u_pulse * 0.18);
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  </script>
+
+  <script>
+    // ─── DOM + canvas ─────────────────────────────────────────────────────────
+    const canvas = document.getElementById('stage');
+    const hintEl = document.getElementById('hint');
+    const gl = canvas.getContext('webgl', { antialias: true, alpha: false, premultipliedAlpha: false });
+    if (!gl) {
+      document.body.innerHTML = '<div style="color:#f5b1c7;font-family:sans-serif;text-align:center;padding-top:40vh">WebGL not available.</div>';
+      throw new Error('no-webgl');
+    }
+
+    let W = 0, H = 0, DPR = 1;
+    function resize() {
+      DPR = Math.min(window.devicePixelRatio || 1, 2);
+      W = window.innerWidth;
+      H = window.innerHeight;
+      canvas.width  = Math.floor(W * DPR);
+      canvas.height = Math.floor(H * DPR);
+      canvas.style.width = W + 'px';
+      canvas.style.height = H + 'px';
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      seedSpikes();
+    }
+
+    // ─── Shader compile ───────────────────────────────────────────────────────
+    function compile(type, src) {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        const log = gl.getShaderInfoLog(sh);
+        gl.deleteShader(sh);
+        throw new Error('shader: ' + log);
+      }
+      return sh;
+    }
+    const vs  = compile(gl.VERTEX_SHADER,   document.getElementById('vs').textContent);
+    const fs  = compile(gl.FRAGMENT_SHADER, document.getElementById('fs').textContent);
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      throw new Error('link: ' + gl.getProgramInfoLog(prog));
+    }
+    gl.useProgram(prog);
+
+    // Fullscreen quad
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -1, -1,  1, -1, -1,  1,
+      -1,  1,  1, -1,  1,  1,
+    ]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(prog, 'a_pos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    // Uniform locations
+    const U = {
+      res:        gl.getUniformLocation(prog, 'u_res'),
+      time:       gl.getUniformLocation(prog, 'u_time'),
+      breath:     gl.getUniformLocation(prog, 'u_breath'),
+      spikes:     gl.getUniformLocation(prog, 'u_spikes'),
+      spikePower: gl.getUniformLocation(prog, 'u_spikePower'),
+      baseY:      gl.getUniformLocation(prog, 'u_baseY'),
+      pulse:      gl.getUniformLocation(prog, 'u_pulse'),
+    };
+
+    // ─── Spike simulation ─────────────────────────────────────────────────────
+    const N = 10;
+    const spikes = [];
+    let baseY = 0;
+
+    function seedSpikes() {
+      baseY = H * 0.62;
+      // Distribute across width; offset baseX with mild jitter
+      const span = W * 0.92;
+      const left = (W - span) / 2;
+      for (let i = 0; i < N; i++) {
+        const t = (i + 0.5) / N;
+        const baseX = left + t * span + (Math.random() - 0.5) * (span / N) * 0.4;
+        const prev = spikes[i];
+        spikes[i] = {
+          baseX,
+          x: prev ? prev.x : baseX,
+          y: prev ? prev.y : baseY,
+          vx: prev ? prev.vx : 0,
+          vy: prev ? prev.vy : 0,
+          power: prev ? prev.power : 0,
+        };
+      }
+    }
+
+    let finger = { x: -9999, y: -9999, active: false, justPressed: false };
+    let pointerId = null;
+    // Debug hooks
+    window.__ferro = { spikes, finger, get baseY(){ return baseY; }, get W(){ return W; }, get H(){ return H; } };
+
+    function setFinger(e) {
+      const rect = canvas.getBoundingClientRect();
+      finger.x = e.clientX - rect.left;
+      finger.y = e.clientY - rect.top;
+    }
+
+    canvas.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      pointerId = e.pointerId;
+      finger.active = true;
+      finger.justPressed = true;
+      setFinger(e);
+      onFirstTouch();
+    });
+    canvas.addEventListener('pointermove', (e) => {
+      if (!finger.active || e.pointerId !== pointerId) return;
+      setFinger(e);
+    });
+    function endPointer(e) {
+      if (e.pointerId !== pointerId) return;
+      finger.active = false;
+      pointerId = null;
+    }
+    canvas.addEventListener('pointerup',     endPointer);
+    canvas.addEventListener('pointercancel', endPointer);
+    canvas.addEventListener('pointerleave',  endPointer);
+
+    // ─── Audio ────────────────────────────────────────────────────────────────
+    // Ambient: breathing drone with real silent gaps. Per CLAUDE.md rule, never
+    // init or start ambient on mount — only on first pointerdown.
+    let actx = null, masterGain = null, droneGain = null, droneOsc = null, droneLfo = null;
+    let firstTouched = false;
+    let liveVoices = 0;
+    const MAX_VOICES = 12;
+
+    function initAudio() {
+      if (actx) return;
+      try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        actx = new Ctx();
+        masterGain = actx.createGain();
+        masterGain.gain.value = 0.45;
+        masterGain.connect(actx.destination);
+
+        // Drone: 56Hz sine + slight detuned partial. We drive its gain via the
+        // breathing envelope (drive() below) so it swells with silent gaps.
+        droneGain = actx.createGain();
+        droneGain.gain.value = 0.0001;
+        droneGain.connect(masterGain);
+        const o1 = actx.createOscillator();
+        o1.type = 'sine'; o1.frequency.value = 56;
+        const o2 = actx.createOscillator();
+        o2.type = 'sine'; o2.frequency.value = 84.5;
+        const o2g = actx.createGain(); o2g.gain.value = 0.32;
+        o1.connect(droneGain);
+        o2.connect(o2g).connect(droneGain);
+        o1.start(); o2.start();
+        droneOsc = o1; droneLfo = o2;
+
+        // Kick off the breathing envelope
+        scheduleNextBreath();
+      } catch (e) { actx = null; }
+    }
+    function audioReady() {
+      return actx && actx.state === 'running' && liveVoices < MAX_VOICES;
+    }
+    function trackVoice(durMs) {
+      liveVoices++;
+      setTimeout(() => { liveVoices--; }, durMs + 30);
+    }
+
+    // Breathing envelope: rise → hold → fall → silence, each phase random duration.
+    function scheduleNextBreath() {
+      if (!actx || !droneGain) return;
+      const t0 = actx.currentTime;
+      const rise   = 5 + Math.random() * 3;
+      const hold   = 8 + Math.random() * 8;
+      const fall   = 6 + Math.random() * 4;
+      const silent = 7 + Math.random() * 9;
+      const peak   = 0.06 + Math.random() * 0.08; // 0.06–0.14
+      const g = droneGain.gain;
+      g.cancelScheduledValues(t0);
+      g.setValueAtTime(Math.max(g.value, 0.0001), t0);
+      g.exponentialRampToValueAtTime(peak,   t0 + rise);
+      g.setValueAtTime(peak,                 t0 + rise + hold);
+      g.exponentialRampToValueAtTime(0.0001, t0 + rise + hold + fall);
+      const total = rise + hold + fall + silent;
+      setTimeout(scheduleNextBreath, total * 1000);
+    }
+
+    function playPing(freq, vol) {
+      if (!audioReady()) return;
+      const t = actx.currentTime;
+      const o1 = actx.createOscillator();
+      const o2 = actx.createOscillator();
+      const g  = actx.createGain();
+      const bp = actx.createBiquadFilter();
+      bp.type = 'bandpass'; bp.frequency.value = freq; bp.Q.value = 6;
+      o1.type = 'sine'; o1.frequency.value = freq;
+      o2.type = 'sine'; o2.frequency.value = freq * 1.502; // glassy 5th-ish
+      const o2g = actx.createGain(); o2g.gain.value = 0.35;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(vol, t + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.42);
+      o1.connect(bp).connect(g).connect(masterGain);
+      o2.connect(o2g).connect(g);
+      o1.start(t); o2.start(t);
+      o1.stop(t + 0.46); o2.stop(t + 0.46);
+      trackVoice(460);
+    }
+
+    function onFirstTouch() {
+      if (firstTouched) return;
+      firstTouched = true;
+      hintEl.classList.add('is-gone');
+      try { localStorage.setItem('ferrofluid:played', '1'); } catch (_) {}
+      initAudio();
+    }
+
+    // Returning visitors don't need the hint — fade it before they touch.
+    try {
+      if (localStorage.getItem('ferrofluid:played')) {
+        hintEl.classList.add('is-gone');
+      }
+    } catch (_) {}
+
+    // ─── Main loop ────────────────────────────────────────────────────────────
+    const spikeData = new Float32Array(N * 2);
+    const powerData = new Float32Array(N);
+
+    let last = performance.now();
+    let breathPhase = 0;
+
+    function step() {
+      const now = performance.now();
+      const dt  = Math.min(33, now - last); last = now;
+      const dtN = dt / 16.7; // normalize to 60fps "units"
+
+      // Breath LFO drives baseline ripple amplitude and a hint of background warmth
+      breathPhase += dt * 0.00045;
+      const breath = 0.5 + 0.5 * Math.sin(breathPhase);
+
+      // Update spikes
+      let totalPower = 0;
+      for (let i = 0; i < N; i++) {
+        const s = spikes[i];
+        let fx = 0, fy = 0;
+
+        if (finger.active) {
+          const dx = finger.x - s.x;
+          const dy = finger.y - s.y;
+          const d  = Math.sqrt(dx * dx + dy * dy) + 0.1;
+          // Peaked falloff: ~0 at d=0 (so spike settles AT finger), peak around
+          // 50px, decays at distance. Means spike chases the finger and parks
+          // just under it without overshooting forever.
+          const r = d / 50;
+          const fall = r / (r * r * r + 0.55);
+          fx += (dx / d) * fall * 2.2;   // weaker lateral pull — spikes don't bunch
+          fy += (dy / d) * fall * 6.5;   // stronger vertical pull — spikes leap up
+          // Power grows with proximity to tip
+          const prox = Math.max(0, 1 - d / (W * 0.55));
+          s.power = Math.min(1, s.power + dtN * 0.09 * prox);
+        } else {
+          s.power = Math.max(0, s.power - dtN * 0.024);
+        }
+
+        // Stiffer x spring keeps spikes spaced (so multiple stand up rather than
+        // bunching at the finger); soft y spring lets them soar.
+        const sx = s.x - s.baseX;
+        const sy = s.y - baseY;
+        fx -= sx * 0.040;
+        fy -= sy * 0.006;
+
+        // Light gravity, dominated by magnet when powered
+        fy += 0.10 * (1 - s.power * 0.95);
+
+        s.vx = (s.vx + fx * dtN) * 0.88;
+        s.vy = (s.vy + fy * dtN) * 0.88;
+        s.x += s.vx * dtN;
+        s.y += s.vy * dtN;
+
+        // Tips can't dip below baseline (sit on the pool surface or above it)
+        if (s.y > baseY) { s.y = baseY; if (s.vy > 0) s.vy = 0; }
+
+        // Spike ping when power crosses high threshold from below
+        if (s.power > 0.62 && s._prevPower <= 0.62 && audioReady()) {
+          // Glassy ping in 1.6–3.4 kHz range, faintly per spike
+          const freq = 1600 + Math.random() * 1800;
+          playPing(freq, 0.12 + Math.random() * 0.08);
+        }
+        s._prevPower = s.power;
+
+        spikeData[i * 2]     = s.x;
+        spikeData[i * 2 + 1] = s.y;
+        powerData[i]         = s.power;
+        totalPower += s.power;
+      }
+
+      const pulse = Math.min(1, totalPower / N);
+
+      // ─── Draw ──────────────────────────────────────────────────────────────
+      gl.uniform2f(U.res, canvas.width, canvas.height);
+      gl.uniform1f(U.time, now * 0.001);
+      gl.uniform1f(U.breath, breath);
+      gl.uniform1f(U.baseY, baseY * DPR);
+      gl.uniform1f(U.pulse, pulse);
+
+      // Scale spike coords to device-pixel space for the shader
+      const scaled = new Float32Array(N * 2);
+      for (let i = 0; i < N; i++) {
+        scaled[i * 2]     = spikes[i].x * DPR;
+        scaled[i * 2 + 1] = spikes[i].y * DPR;
+      }
+      gl.uniform2fv(U.spikes, scaled);
+      gl.uniform1fv(U.spikePower, powerData);
+
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+      requestAnimationFrame(step);
+    }
+
+    resize();
+    window.addEventListener('resize', resize);
+    requestAnimationFrame(step);
+  </script>
+</body>
+</html>
