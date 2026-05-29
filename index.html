@@ -14,12 +14,17 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@1,500&family=Inter:wght@400;600&display=swap" rel="stylesheet" />
   <style>
-    * {
+    /* iOS Safari sometimes still fires the long-press selection magnifier when only
+       html/body have user-select: none. Belt + suspenders on every element. */
+    *, *::before, *::after {
       box-sizing: border-box;
       -webkit-tap-highlight-color: transparent;
-      -webkit-touch-callout: none;
-      -webkit-user-select: none;
-      user-select: none;
+      -webkit-touch-callout: none !important;
+      -webkit-user-select: none !important;
+      -moz-user-select: none !important;
+      -ms-user-select: none !important;
+      user-select: none !important;
+      -webkit-user-drag: none;
     }
     html, body {
       margin: 0; padding: 0; width: 100%; height: 100%;
@@ -28,7 +33,9 @@
       overflow: hidden;
       touch-action: none;
       overscroll-behavior: none;
+      -webkit-text-size-adjust: 100%;
     }
+    canvas, img { -webkit-user-drag: none; -webkit-touch-callout: none; }
     /* No in-game border-radius: Aigram host already wraps the game with a rounded
        frame, so adding one here would double-round and clip overflowing chrome. */
     body { position: relative; }
@@ -70,24 +77,47 @@
     .hint {
       position: absolute;
       left: 50%;
-      top: 28%;
-      transform: translate(-50%, -50%);
+      bottom: 14%;
+      transform: translateX(-50%);
       font-family: "Inter", sans-serif;
       font-weight: 400;
-      font-size: 13px;
+      font-size: 12px;
       letter-spacing: 0.34em;
       text-transform: uppercase;
       color: rgba(245, 177, 199, 0.55);
       pointer-events: none;
-      z-index: 4;
+      z-index: 5;
       animation: ferro-hint 2.4s ease-in-out infinite;
-      transition: opacity 1.6s ease;
+      transition: opacity 1.4s ease;
     }
     .hint.is-gone { opacity: 0; }
 
     @keyframes ferro-hint {
       0%, 100% { opacity: 0.32; }
       50%      { opacity: 0.72; }
+    }
+
+    /* Demo finger — Google Material touch_app glyph that traces a drag across the
+       pool. Loops every 4s until first real pointerdown, then fades. */
+    .demo-finger {
+      position: absolute;
+      top: 0; left: 0;
+      width: 56px; height: 56px;
+      pointer-events: none;
+      z-index: 5;
+      opacity: 0;
+      transition: opacity 0.6s ease;
+      will-change: transform, opacity;
+    }
+    .demo-finger.is-on { opacity: 0.92; }
+    .demo-finger.is-gone { opacity: 0 !important; transition: opacity 1.2s ease; }
+    .demo-finger svg {
+      width: 100%; height: 100%;
+      fill: rgba(245, 177, 199, 0.95);
+      filter:
+        drop-shadow(0 0 8px rgba(245, 177, 199, 0.45))
+        drop-shadow(0 0 18px rgba(119, 0, 161, 0.55))
+        drop-shadow(0 2px 4px rgba(0, 0, 0, 0.55));
     }
 
     /* Subtle vignette layered above canvas — adds depth without bleeding into the metal */
@@ -102,9 +132,14 @@
 <body>
   <canvas id="stage"></canvas>
   <div class="vignette"></div>
-  <img class="wm" src="./alteru.svg" alt="AlterU" />
+  <img class="wm" src="./alteru.svg" alt="AlterU" draggable="false" />
   <div class="title">ferrofluid</div>
   <div class="hint" id="hint">drag the pool</div>
+  <div class="demo-finger" id="demoFinger" aria-hidden="true">
+    <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+      <path d="M9 11.24V7.5C9 6.12 10.12 5 11.5 5S14 6.12 14 7.5v3.74c1.21-.81 2-2.18 2-3.74C16 5.01 13.99 3 11.5 3S7 5.01 7 7.5c0 1.56.79 2.93 2 3.74zm9.84 4.63l-4.54-2.26c-.17-.07-.35-.11-.54-.11H13v-6c0-.83-.67-1.5-1.5-1.5S10 6.67 10 7.5v10.74l-3.43-.72c-.08-.01-.15-.03-.24-.03-.31 0-.59.13-.79.33l-.79.8 4.94 4.94c.27.27.65.44 1.06.44h6.79c.75 0 1.33-.55 1.44-1.28l.75-5.27c.01-.07.02-.14.02-.2 0-.62-.38-1.16-.92-1.38z"/>
+    </svg>
+  </div>
 
   <script id="vs" type="x-shader/x-vertex">
     attribute vec2 a_pos;
@@ -114,7 +149,8 @@
   <script id="fs" type="x-shader/x-fragment">
     precision highp float;
 
-    #define N_SPIKES 10
+    #define N_SPIKES  10
+    #define N_RIPPLES 4
 
     uniform vec2  u_res;
     uniform float u_time;
@@ -122,11 +158,34 @@
     uniform vec2  u_spikes[N_SPIKES];
     uniform float u_spikePower[N_SPIKES];
     uniform float u_baseY;
-    uniform float u_pulse;     // 0-1 global activity used for color saturation
+    uniform float u_pulse;       // 0-1 global activity used for color saturation
+    // Ripples — each (x, age). age in seconds since spawn; <0 = unused slot.
+    uniform vec2  u_ripples[N_RIPPLES];
+    // Palette tint — chrome silver = (1,1,1); other entries shift hue (amber/rose/violet/mint)
+    uniform vec3  u_paletteTint;   // multiplier applied to chrome highlight + rim
+    uniform vec3  u_paletteAccent; // tint for the pink fresnel band (rotates with mood)
 
     float smin(float a, float b, float k) {
       float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
       return mix(b, a, h) - k * h * (1.0 - h);
+    }
+
+    // Ripple displacement at x: each ripple emits two outward-traveling crests
+    // that decay with age + distance.
+    float ripple(float x) {
+      float total = 0.0;
+      for (int i = 0; i < N_RIPPLES; i++) {
+        vec2  r = u_ripples[i];
+        float age = r.y;
+        if (age < 0.0) continue;
+        float dist  = abs(x - r.x);
+        float speed = 260.0;
+        float front = age * speed;
+        float band  = exp(-pow((dist - front) / 70.0, 2.0));
+        float decay = exp(-age * 1.6);
+        total += band * decay * 9.0;
+      }
+      return total;
     }
 
     float poolBaseline(float x) {
@@ -134,6 +193,7 @@
       b -= sin(x * 0.0085 + u_time * 0.32) * 3.6 * (0.45 + u_breath * 0.55);
       b -= sin(x * 0.022  - u_time * 0.71) * 1.4;
       b -= sin(x * 0.005  + u_time * 0.18) * 1.8;
+      b -= ripple(x);
       return b;
     }
 
@@ -181,9 +241,9 @@
         // Vertical brightness — tips read silver, belly reads obsidian
         float verticalTip = clamp((u_baseY + 14.0 - p.y) / (u_res.y * 0.36), 0.0, 1.0);
 
-        vec3 chromeBase = vec3(0.008, 0.006, 0.014);    // nearly black, slight cool tint
-        vec3 chromeSurf = vec3(0.18, 0.16, 0.22);       // mid silver near surface
-        vec3 chromeRim  = vec3(0.92, 0.90, 0.98);       // bright silver knife edge
+        vec3 chromeBase = vec3(0.008, 0.006, 0.014);    // nearly black
+        vec3 chromeSurf = vec3(0.18, 0.16, 0.22) * u_paletteTint; // tinted by mood
+        vec3 chromeRim  = vec3(0.92, 0.90, 0.98) * u_paletteTint;
 
         col = chromeBase;
         col = mix(col, chromeSurf, surface * (0.55 + 0.45 * verticalTip));
@@ -193,17 +253,17 @@
         float band = sin(p.y * 0.013 - u_time * 0.28) * 0.5 + 0.5;
         col += vec3(0.030, 0.025, 0.040) * band * belly * 0.55;
 
-        // AlterU pink fresnel on outer band — strongest on tips
+        // Fresnel accent band on the outer edge — shifts hue with the mood palette
         float pinkBand = smoothstep(-10.0, -1.5, d) * (1.0 - smoothstep(-1.5, 0.0, d));
-        col += vec3(0.96, 0.69, 0.78) * pinkBand * (0.25 + 0.65 * verticalTip);
+        col += u_paletteAccent * pinkBand * (0.25 + 0.65 * verticalTip);
 
         // Purple peak glow on the very tips
         float peak = smoothstep(0.74, 1.0, verticalTip);
-        col += vec3(0.47, 0.0, 0.63) * peak * rim * 0.65;
-        col += vec3(1.0, 0.86, 0.94) * peak * rim * 0.4;
+        col += vec3(0.47, 0.0, 0.63) * peak * rim * 0.55;
+        col += u_paletteAccent     * peak * rim * 0.5;
 
       } else {
-        // Outside: subtle glow halo from spike tips
+        // Outside: subtle glow halo from spike tips, tinted by mood palette
         float glow = 0.0;
         for (int i = 0; i < N_SPIKES; i++) {
           vec2  tip = u_spikes[i];
@@ -211,8 +271,8 @@
           float dd  = length(p - tip);
           glow += pw * 14.0 / (dd * dd + 32.0);
         }
-        col += vec3(0.96, 0.69, 0.78) * glow * 0.55;
-        col += vec3(0.47, 0.0, 0.63) * glow * 0.32;
+        col += u_paletteAccent          * glow * 0.55;
+        col += vec3(0.47, 0.0, 0.63)    * glow * 0.32;
       }
 
       // Global pulse — when toy is being touched, the world breathes slightly warmer
@@ -288,6 +348,9 @@
       spikePower: gl.getUniformLocation(prog, 'u_spikePower'),
       baseY:      gl.getUniformLocation(prog, 'u_baseY'),
       pulse:      gl.getUniformLocation(prog, 'u_pulse'),
+      ripples:    gl.getUniformLocation(prog, 'u_ripples'),
+      pTint:      gl.getUniformLocation(prog, 'u_paletteTint'),
+      pAccent:    gl.getUniformLocation(prog, 'u_paletteAccent'),
     };
 
     // ─── Spike simulation ─────────────────────────────────────────────────────
@@ -315,37 +378,124 @@
       }
     }
 
-    let finger = { x: -9999, y: -9999, active: false, justPressed: false };
-    let pointerId = null;
-    // Debug hooks
-    window.__ferro = { spikes, finger, get baseY(){ return baseY; }, get W(){ return W; }, get H(){ return H; } };
+    // Multi-touch: every active pointer becomes its own finger; spikes sum forces
+    // from all of them. Each pointer remembers its press time + path length so we
+    // can classify quick taps (→ ripple) vs holds/drags (→ spike pull).
+    const fingers = new Map(); // pointerId → { x, y, t0, pathLen, lastX, lastY }
 
-    function setFinger(e) {
+    // Tap ripples — short outward waves from a tap site. Slots are reused round-robin.
+    const ripples = [
+      { x: 0, age: -1 }, { x: 0, age: -1 }, { x: 0, age: -1 }, { x: 0, age: -1 },
+    ];
+    let nextRipple = 0;
+    function spawnRipple(x) {
+      ripples[nextRipple] = { x, age: 0 };
+      nextRipple = (nextRipple + 1) % ripples.length;
+      if (audioReady()) playPing(620 + Math.random() * 280, 0.10);
+    }
+
+    // Mood palette — drifts based on cumulative hold time during a session.
+    // Each preset = (chromeTint, accent). Drifts every ~6s of active hold time.
+    const MOODS = [
+      { tint: [1.00, 1.00, 1.00], accent: [0.96, 0.69, 0.78] },  // 0 silver chrome + AlterU pink
+      { tint: [1.10, 0.92, 0.72], accent: [1.00, 0.78, 0.36] },  // 1 amber
+      { tint: [1.00, 0.78, 0.86], accent: [1.00, 0.50, 0.72] },  // 2 rose
+      { tint: [0.86, 0.82, 1.10], accent: [0.72, 0.48, 1.00] },  // 3 violet
+      { tint: [0.80, 1.05, 0.92], accent: [0.55, 1.00, 0.84] },  // 4 mint
+    ];
+    let moodIdx = 0, moodNext = 0, moodT = 1; // moodT 0..1 — start settled at chrome
+    let activeHoldSecs = 0;
+    let lastBumpMood = 0;
+    const palTint   = [1, 1, 1];
+    const palAccent = [0.96, 0.69, 0.78];
+
+    // Debug hooks (keep across major refactor — useful for QA later)
+    window.__ferro = {
+      spikes, fingers, ripples,
+      get baseY(){ return baseY; }, get W(){ return W; }, get H(){ return H; },
+      get moodIdx(){ return moodIdx; }, get activeHoldSecs(){ return activeHoldSecs; },
+    };
+
+    function pointFromEvent(e) {
       const rect = canvas.getBoundingClientRect();
-      finger.x = e.clientX - rect.left;
-      finger.y = e.clientY - rect.top;
+      return { x: e.clientX - rect.left, y: e.clientY - rect.top };
     }
 
     canvas.addEventListener('pointerdown', (e) => {
       e.preventDefault();
-      pointerId = e.pointerId;
-      finger.active = true;
-      finger.justPressed = true;
-      setFinger(e);
       onFirstTouch();
+      const { x, y } = pointFromEvent(e);
+      fingers.set(e.pointerId, {
+        x, y, t0: performance.now(), pathLen: 0, lastX: x, lastY: y,
+      });
+      try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
     });
     canvas.addEventListener('pointermove', (e) => {
-      if (!finger.active || e.pointerId !== pointerId) return;
-      setFinger(e);
+      const f = fingers.get(e.pointerId);
+      if (!f) return;
+      const { x, y } = pointFromEvent(e);
+      const dx = x - f.lastX, dy = y - f.lastY;
+      f.pathLen += Math.sqrt(dx * dx + dy * dy);
+      f.x = x; f.y = y;
+      f.lastX = x; f.lastY = y;
     });
     function endPointer(e) {
-      if (e.pointerId !== pointerId) return;
-      finger.active = false;
-      pointerId = null;
+      const f = fingers.get(e.pointerId);
+      if (!f) return;
+      // Classify: short press + tiny path = tap (→ ripple); otherwise it was a drag.
+      const heldMs = performance.now() - f.t0;
+      if (heldMs < 220 && f.pathLen < 10) spawnRipple(f.x);
+      fingers.delete(e.pointerId);
+      try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
     }
     canvas.addEventListener('pointerup',     endPointer);
     canvas.addEventListener('pointercancel', endPointer);
     canvas.addEventListener('pointerleave',  endPointer);
+    // Silence the long-press context menu just in case the CSS belt+suspenders
+    // misses some webview quirk.
+    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    // ─── Demo finger ──────────────────────────────────────────────────────────
+    // Per CLAUDE.md (feedback_intro_demo_must_loop): loop a Material touch_app
+    // glyph + a phantom finger that pulls spikes, until first real pointerdown.
+    const demoEl = document.getElementById('demoFinger');
+    const demo = { x: -9999, y: -9999, active: false, phase: 0 };
+    function showDemoAt(x, y, on) {
+      demoEl.style.transform = `translate(${x - 12}px, ${y - 8}px)`; // anchor near fingertip
+      demoEl.classList.toggle('is-on', on && !firstTouched);
+    }
+    async function runDemoLoop() {
+      // Wait one frame so layout + sizing has settled
+      await new Promise(r => requestAnimationFrame(r));
+      while (!firstTouched) {
+        // Returning visitor — skip the demo
+        if (localStorage.getItem('ferrofluid:played')) return;
+        const cycleStart = performance.now();
+        const dur = 4400; // ~4.4s per cycle
+        const yArc = (t) => H * 0.42 - Math.sin(t * Math.PI) * 26;
+        while (!firstTouched) {
+          const t = (performance.now() - cycleStart) / dur;
+          if (t >= 1) break;
+          // ease in/out for x sweep
+          const e = 0.5 - 0.5 * Math.cos(t * Math.PI);
+          const x = W * 0.18 + e * W * 0.64;
+          const y = yArc(t);
+          demo.x = x; demo.y = y; demo.active = true;
+          showDemoAt(x, y, t > 0.04 && t < 0.96);
+          await new Promise(r => requestAnimationFrame(r));
+        }
+        demo.active = false;
+        showDemoAt(-9999, -9999, false);
+        // Brief pause before next cycle
+        const pauseStart = performance.now();
+        while (!firstTouched && performance.now() - pauseStart < 700) {
+          await new Promise(r => requestAnimationFrame(r));
+        }
+      }
+      demoEl.classList.add('is-gone');
+      demo.active = false;
+    }
+    runDemoLoop();
 
     // ─── Audio ────────────────────────────────────────────────────────────────
     // Ambient: breathing drone with real silent gaps. Per CLAUDE.md rule, never
@@ -448,51 +598,81 @@
     } catch (_) {}
 
     // ─── Main loop ────────────────────────────────────────────────────────────
-    const spikeData = new Float32Array(N * 2);
-    const powerData = new Float32Array(N);
+    const powerData  = new Float32Array(N);
+    const spikeBuf   = new Float32Array(N * 2);
+    const rippleBuf  = new Float32Array(ripples.length * 2);
 
     let last = performance.now();
     let breathPhase = 0;
 
+    // Each "force source" is a (x, y, gain) tuple — real fingers + the demo
+    // finger when active. forceList is rebuilt every frame.
+    const forceList = [];
+
+    function applyForceFromPoint(fx, fy, gain, s) {
+      const dx = fx - s.x;
+      const dy = fy - s.y;
+      const d  = Math.sqrt(dx * dx + dy * dy) + 0.1;
+      const r  = d / 50;
+      const fall = r / (r * r * r + 0.55);
+      return {
+        ax: (dx / d) * fall * 2.2 * gain,
+        ay: (dy / d) * fall * 6.5 * gain,
+        proxBoost: Math.max(0, 1 - d / (W * 0.55)) * gain,
+      };
+    }
+
     function step() {
       const now = performance.now();
       const dt  = Math.min(33, now - last); last = now;
-      const dtN = dt / 16.7; // normalize to 60fps "units"
+      const dtN = dt / 16.7;
+      const dtSec = dt / 1000;
 
-      // Breath LFO drives baseline ripple amplitude and a hint of background warmth
       breathPhase += dt * 0.00045;
       const breath = 0.5 + 0.5 * Math.sin(breathPhase);
+
+      // Build force-source list this frame: real fingers (gain 1.0) + demo (gain 0.85)
+      forceList.length = 0;
+      for (const f of fingers.values()) forceList.push({ x: f.x, y: f.y, gain: 1.0 });
+      if (!firstTouched && demo.active) forceList.push({ x: demo.x, y: demo.y, gain: 0.85 });
+      const haveForce = forceList.length > 0;
+
+      // Track active hold time → drives mood drift
+      if (fingers.size > 0) activeHoldSecs += dtSec;
+      if (Math.floor(activeHoldSecs / 6) > lastBumpMood) {
+        lastBumpMood = Math.floor(activeHoldSecs / 6);
+        moodNext = (moodIdx + 1) % MOODS.length;
+        moodT = 0;
+      }
+      if (moodT < 1) {
+        moodT = Math.min(1, moodT + dtSec * 0.25); // ~4s to settle on the next mood
+        if (moodT >= 1) moodIdx = moodNext;
+      }
+      const m0 = MOODS[moodIdx], m1 = MOODS[moodNext];
+      for (let k = 0; k < 3; k++) {
+        palTint[k]   = m0.tint[k]   * (1 - moodT) + m1.tint[k]   * moodT;
+        palAccent[k] = m0.accent[k] * (1 - moodT) + m1.accent[k] * moodT;
+      }
 
       // Update spikes
       let totalPower = 0;
       for (let i = 0; i < N; i++) {
         const s = spikes[i];
-        let fx = 0, fy = 0;
+        let fx = 0, fy = 0, proxSum = 0;
 
-        if (finger.active) {
-          const dx = finger.x - s.x;
-          const dy = finger.y - s.y;
-          const d  = Math.sqrt(dx * dx + dy * dy) + 0.1;
-          // Peaked falloff: ~0 at d=0 (so spike settles AT finger), peak around
-          // 50px, decays at distance. Means spike chases the finger and parks
-          // just under it without overshooting forever.
-          const r = d / 50;
-          const fall = r / (r * r * r + 0.55);
-          fx += (dx / d) * fall * 2.2;   // weaker lateral pull — spikes don't bunch
-          fy += (dy / d) * fall * 6.5;   // stronger vertical pull — spikes leap up
-          // Power grows with proximity to tip
-          const prox = Math.max(0, 1 - d / (W * 0.55));
-          s.power = Math.min(1, s.power + dtN * 0.09 * prox);
+        if (haveForce) {
+          for (const src of forceList) {
+            const r = applyForceFromPoint(src.x, src.y, src.gain, s);
+            fx += r.ax; fy += r.ay; proxSum += r.proxBoost;
+          }
+          s.power = Math.min(1, s.power + dtN * 0.09 * proxSum);
         } else {
           s.power = Math.max(0, s.power - dtN * 0.024);
         }
 
-        // Stiffer x spring keeps spikes spaced (so multiple stand up rather than
-        // bunching at the finger); soft y spring lets them soar.
-        const sx = s.x - s.baseX;
-        const sy = s.y - baseY;
-        fx -= sx * 0.040;
-        fy -= sy * 0.006;
+        // Springs
+        fx -= (s.x - s.baseX) * 0.040;
+        fy -= (s.y - baseY)   * 0.006;
 
         // Light gravity, dominated by magnet when powered
         fy += 0.10 * (1 - s.power * 0.95);
@@ -502,21 +682,32 @@
         s.x += s.vx * dtN;
         s.y += s.vy * dtN;
 
-        // Tips can't dip below baseline (sit on the pool surface or above it)
+        // Tips sit on or above the surface
         if (s.y > baseY) { s.y = baseY; if (s.vy > 0) s.vy = 0; }
 
-        // Spike ping when power crosses high threshold from below
+        // Spike ping crossing high threshold
         if (s.power > 0.62 && s._prevPower <= 0.62 && audioReady()) {
-          // Glassy ping in 1.6–3.4 kHz range, faintly per spike
-          const freq = 1600 + Math.random() * 1800;
-          playPing(freq, 0.12 + Math.random() * 0.08);
+          playPing(1600 + Math.random() * 1800, 0.12 + Math.random() * 0.08);
         }
         s._prevPower = s.power;
 
-        spikeData[i * 2]     = s.x;
-        spikeData[i * 2 + 1] = s.y;
+        spikeBuf[i * 2]     = s.x * DPR;
+        spikeBuf[i * 2 + 1] = s.y * DPR;
         powerData[i]         = s.power;
         totalPower += s.power;
+      }
+
+      // Advance ripples
+      for (let i = 0; i < ripples.length; i++) {
+        const r = ripples[i];
+        if (r.age < 0) {
+          rippleBuf[i * 2] = -1; rippleBuf[i * 2 + 1] = -1;
+        } else {
+          r.age += dtSec;
+          if (r.age > 1.7) { r.age = -1; rippleBuf[i * 2 + 1] = -1; continue; }
+          rippleBuf[i * 2]     = r.x * DPR;
+          rippleBuf[i * 2 + 1] = r.age;
+        }
       }
 
       const pulse = Math.min(1, totalPower / N);
@@ -527,15 +718,11 @@
       gl.uniform1f(U.breath, breath);
       gl.uniform1f(U.baseY, baseY * DPR);
       gl.uniform1f(U.pulse, pulse);
-
-      // Scale spike coords to device-pixel space for the shader
-      const scaled = new Float32Array(N * 2);
-      for (let i = 0; i < N; i++) {
-        scaled[i * 2]     = spikes[i].x * DPR;
-        scaled[i * 2 + 1] = spikes[i].y * DPR;
-      }
-      gl.uniform2fv(U.spikes, scaled);
+      gl.uniform2fv(U.spikes, spikeBuf);
       gl.uniform1fv(U.spikePower, powerData);
+      gl.uniform2fv(U.ripples, rippleBuf);
+      gl.uniform3fv(U.pTint, palTint);
+      gl.uniform3fv(U.pAccent, palAccent);
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);
 
