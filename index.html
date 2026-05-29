@@ -45,6 +45,16 @@
       width: 100%; height: 100%;
       background: #040208;
     }
+    /* Additive 2D overlay for sparkles, magnetic field rings, droplets — anything
+       that wants soft additive light on top of the shader pool. */
+    #fx {
+      position: absolute; inset: 0;
+      display: block;
+      width: 100%; height: 100%;
+      pointer-events: none;
+      z-index: 3;
+      mix-blend-mode: screen;
+    }
 
     .wm {
       position: absolute;
@@ -131,6 +141,7 @@
 </head>
 <body>
   <canvas id="stage"></canvas>
+  <canvas id="fx"></canvas>
   <div class="vignette"></div>
   <img class="wm" src="./alteru.svg" alt="AlterU" draggable="false" />
   <div class="title">ferrofluid</div>
@@ -285,6 +296,8 @@
   <script>
     // ─── DOM + canvas ─────────────────────────────────────────────────────────
     const canvas = document.getElementById('stage');
+    const fxCanvas = document.getElementById('fx');
+    const fxCtx = fxCanvas.getContext('2d');
     const hintEl = document.getElementById('hint');
     const gl = canvas.getContext('webgl', { antialias: true, alpha: false, premultipliedAlpha: false });
     if (!gl) {
@@ -301,6 +314,11 @@
       canvas.height = Math.floor(H * DPR);
       canvas.style.width = W + 'px';
       canvas.style.height = H + 'px';
+      fxCanvas.width  = Math.floor(W * DPR);
+      fxCanvas.height = Math.floor(H * DPR);
+      fxCanvas.style.width = W + 'px';
+      fxCanvas.style.height = H + 'px';
+      fxCtx.setTransform(DPR, 0, 0, DPR, 0, 0); // draw in CSS pixels
       gl.viewport(0, 0, canvas.width, canvas.height);
       seedSpikes();
     }
@@ -374,8 +392,55 @@
           vx: prev ? prev.vx : 0,
           vy: prev ? prev.vy : 0,
           power: prev ? prev.power : 0,
+          sustain: prev ? prev.sustain : 0,   // seconds at peak
+          sparkClk: 0,                          // throttles sparkle emission
         };
       }
+    }
+
+    // ─── Particles ────────────────────────────────────────────────────────────
+    // Single pool: types are 'spark' (small glitter from spike tips) and
+    // 'drop' (chunky pinched-off pearl that arcs and falls back into the pool).
+    const particles = [];
+    const MAX_PARTICLES = 220;
+    function emitSpark(x, y, accentArr) {
+      if (particles.length >= MAX_PARTICLES) return;
+      particles.push({
+        type: 'spark',
+        x, y,
+        vx: (Math.random() - 0.5) * 1.6,
+        vy: -Math.random() * 1.5 - 0.4,
+        age: 0,
+        life: 0.7 + Math.random() * 0.6,
+        size: 1.2 + Math.random() * 1.8,
+        accent: [accentArr[0], accentArr[1], accentArr[2]], // freeze at emit time
+      });
+    }
+    function emitDrop(x, y, accentArr) {
+      if (particles.length >= MAX_PARTICLES) return;
+      particles.push({
+        type: 'drop',
+        x, y,
+        vx: (Math.random() - 0.5) * 0.6,
+        vy: -2.4 - Math.random() * 1.4,
+        age: 0,
+        life: 5.0,
+        size: 5.5 + Math.random() * 1.8,
+        accent: [accentArr[0], accentArr[1], accentArr[2]],
+      });
+    }
+
+    // ─── Magnetic field rings ────────────────────────────────────────────────
+    // Per finger, periodically spawn a concentric ring that expands + fades.
+    // Reads as "this finger is pulling on something invisible".
+    const rings = [];
+    const MAX_RINGS = 28;
+    function emitRing(x, y, accentArr) {
+      if (rings.length >= MAX_RINGS) return;
+      rings.push({
+        x, y, age: 0, life: 1.4,
+        accent: [accentArr[0], accentArr[1], accentArr[2]],
+      });
     }
 
     // Multi-touch: every active pointer becomes its own finger; spikes sum forces
@@ -426,7 +491,11 @@
       onFirstTouch();
       const { x, y } = pointFromEvent(e);
       fingers.set(e.pointerId, {
-        x, y, t0: performance.now(), pathLen: 0, lastX: x, lastY: y,
+        x, y, t0: performance.now(), pathLen: 0,
+        lastX: x, lastY: y, prevT: performance.now(),
+        speed: 0,         // px/sec smoothed
+        lastWhoosh: 0,    // ms timestamp; throttles whoosh emission
+        lastRing: 0,      // ms timestamp; throttles magnetic ring emission
       });
       try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
     });
@@ -435,9 +504,22 @@
       if (!f) return;
       const { x, y } = pointFromEvent(e);
       const dx = x - f.lastX, dy = y - f.lastY;
-      f.pathLen += Math.sqrt(dx * dx + dy * dy);
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const now = performance.now();
+      const dt = Math.max(8, now - f.prevT); // clamp to avoid spikes
+      const inst = (dist / dt) * 1000;       // px/sec
+      f.speed = f.speed * 0.65 + inst * 0.35;
+      f.pathLen += dist;
       f.x = x; f.y = y;
       f.lastX = x; f.lastY = y;
+      f.prevT = now;
+      // Whoosh on fast motion, throttled per finger
+      if (f.speed > 800 && now - f.lastWhoosh > 180 && audioReady()) {
+        const pan = Math.max(-1, Math.min(1, (x / W - 0.5) * 2));
+        const intensity = Math.min(1, (f.speed - 800) / 1800);
+        playWhoosh(pan, intensity);
+        f.lastWhoosh = now;
+      }
     });
     function endPointer(e) {
       const f = fingers.get(e.pointerId);
@@ -498,12 +580,29 @@
     runDemoLoop();
 
     // ─── Audio ────────────────────────────────────────────────────────────────
-    // Ambient: breathing drone with real silent gaps. Per CLAUDE.md rule, never
-    // init or start ambient on mount — only on first pointerdown.
-    let actx = null, masterGain = null, droneGain = null, droneOsc = null, droneLfo = null;
+    // Ambient: layered breathing drone (fundamental + 3rd + 4th harmonic) with
+    // real silent gaps. Pings are pitched to a pentatonic scale by spike height,
+    // not random. Whooshes pan to finger x. Per CLAUDE.md, ambient ONLY starts on
+    // first pointerdown — never on mount (Aigram preloads games).
+    let actx = null, masterGain = null;
+    let droneG1 = null, droneG2 = null, droneG3 = null; // gains for fundamental, 3rd, 4th harmonic
+    let droneBreathGain = null;                         // master breath envelope feeding all drones
+    let noiseBuf = null;
     let firstTouched = false;
     let liveVoices = 0;
-    const MAX_VOICES = 12;
+    const MAX_VOICES = 18;
+
+    // C minor pentatonic across ~2 octaves, low → high. Bottom anchored higher than
+    // typical so spikes that barely peek still feel hopeful, not dirgey.
+    const SCALE = [
+      261.63, 311.13, 349.23, 392.00, 466.16, // C4 D#4 F4 G4 A#4
+      523.25, 622.25, 698.46, 783.99, 932.33, // C5 D#5 F5 G5 A#5
+    ];
+    function pickNote(tipNorm) {
+      // tipNorm 0..1 — 0 at baseline, 1 at canvas top
+      const idx = Math.min(SCALE.length - 1, Math.max(0, Math.floor(tipNorm * SCALE.length)));
+      return SCALE[idx];
+    }
 
     function initAudio() {
       if (actx) return;
@@ -512,25 +611,33 @@
         if (!Ctx) return;
         actx = new Ctx();
         masterGain = actx.createGain();
-        masterGain.gain.value = 0.45;
+        masterGain.gain.value = 0.42;
         masterGain.connect(actx.destination);
 
-        // Drone: 56Hz sine + slight detuned partial. We drive its gain via the
-        // breathing envelope (drive() below) so it swells with silent gaps.
-        droneGain = actx.createGain();
-        droneGain.gain.value = 0.0001;
-        droneGain.connect(masterGain);
-        const o1 = actx.createOscillator();
-        o1.type = 'sine'; o1.frequency.value = 56;
-        const o2 = actx.createOscillator();
-        o2.type = 'sine'; o2.frequency.value = 84.5;
-        const o2g = actx.createGain(); o2g.gain.value = 0.32;
-        o1.connect(droneGain);
-        o2.connect(o2g).connect(droneGain);
-        o1.start(); o2.start();
-        droneOsc = o1; droneLfo = o2;
+        // Breath envelope shared across all drone layers
+        droneBreathGain = actx.createGain();
+        droneBreathGain.gain.value = 0.0001;
+        droneBreathGain.connect(masterGain);
 
-        // Kick off the breathing envelope
+        // Layer 1 — fundamental 56Hz pure sine, anchor weight
+        const o1 = actx.createOscillator(); o1.type = 'sine'; o1.frequency.value = 56;
+        droneG1 = actx.createGain(); droneG1.gain.value = 1.0;
+        o1.connect(droneG1).connect(droneBreathGain); o1.start();
+        // Layer 2 — 3rd harmonic-ish 168Hz, gives body
+        const o2 = actx.createOscillator(); o2.type = 'sine'; o2.frequency.value = 168;
+        droneG2 = actx.createGain(); droneG2.gain.value = 0.20;
+        o2.connect(droneG2).connect(droneBreathGain); o2.start();
+        // Layer 3 — 4th harmonic 224Hz, soft saw for warmth (clamped low to stay ambient)
+        const o3 = actx.createOscillator(); o3.type = 'triangle'; o3.frequency.value = 224;
+        droneG3 = actx.createGain(); droneG3.gain.value = 0.08;
+        o3.connect(droneG3).connect(droneBreathGain); o3.start();
+
+        // Pre-fill ~0.5s mono noise buffer for whooshes
+        const sr = actx.sampleRate;
+        noiseBuf = actx.createBuffer(1, Math.floor(sr * 0.5), sr);
+        const ch = noiseBuf.getChannelData(0);
+        for (let i = 0; i < ch.length; i++) ch[i] = Math.random() * 2 - 1;
+
         scheduleNextBreath();
       } catch (e) { actx = null; }
     }
@@ -542,16 +649,38 @@
       setTimeout(() => { liveVoices--; }, durMs + 30);
     }
 
-    // Breathing envelope: rise → hold → fall → silence, each phase random duration.
+    // Mood-tied drone mix. Called every frame from main loop.
+    function applyMoodToAudio() {
+      if (!actx) return;
+      // Defines each mood's harmonic balance + master fundamental scale.
+      // Chrome is pure & quiet, mints/violets layer more bell-like overtones.
+      const targets = [
+        { g1: 1.00, g2: 0.18, g3: 0.06 }, // chrome
+        { g1: 1.00, g2: 0.30, g3: 0.10 }, // amber
+        { g1: 0.92, g2: 0.42, g3: 0.18 }, // rose
+        { g1: 0.78, g2: 0.55, g3: 0.36 }, // violet
+        { g1: 0.85, g2: 0.50, g3: 0.30 }, // mint
+      ];
+      const a = targets[moodIdx], b = targets[moodNext];
+      const t = moodT;
+      const g1 = a.g1 * (1 - t) + b.g1 * t;
+      const g2 = a.g2 * (1 - t) + b.g2 * t;
+      const g3 = a.g3 * (1 - t) + b.g3 * t;
+      const now = actx.currentTime;
+      droneG1.gain.setTargetAtTime(g1, now, 0.08);
+      droneG2.gain.setTargetAtTime(g2, now, 0.08);
+      droneG3.gain.setTargetAtTime(g3, now, 0.08);
+    }
+
     function scheduleNextBreath() {
-      if (!actx || !droneGain) return;
+      if (!actx || !droneBreathGain) return;
       const t0 = actx.currentTime;
       const rise   = 5 + Math.random() * 3;
       const hold   = 8 + Math.random() * 8;
       const fall   = 6 + Math.random() * 4;
       const silent = 7 + Math.random() * 9;
       const peak   = 0.06 + Math.random() * 0.08; // 0.06–0.14
-      const g = droneGain.gain;
+      const g = droneBreathGain.gain;
       g.cancelScheduledValues(t0);
       g.setValueAtTime(Math.max(g.value, 0.0001), t0);
       g.exponentialRampToValueAtTime(peak,   t0 + rise);
@@ -570,16 +699,65 @@
       const bp = actx.createBiquadFilter();
       bp.type = 'bandpass'; bp.frequency.value = freq; bp.Q.value = 6;
       o1.type = 'sine'; o1.frequency.value = freq;
-      o2.type = 'sine'; o2.frequency.value = freq * 1.502; // glassy 5th-ish
-      const o2g = actx.createGain(); o2g.gain.value = 0.35;
+      o2.type = 'sine'; o2.frequency.value = freq * 1.502;
+      const o2g = actx.createGain(); o2g.gain.value = 0.32;
       g.gain.setValueAtTime(0.0001, t);
       g.gain.exponentialRampToValueAtTime(vol, t + 0.012);
-      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.42);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.48);
       o1.connect(bp).connect(g).connect(masterGain);
       o2.connect(o2g).connect(g);
       o1.start(t); o2.start(t);
-      o1.stop(t + 0.46); o2.stop(t + 0.46);
-      trackVoice(460);
+      o1.stop(t + 0.52); o2.stop(t + 0.52);
+      trackVoice(520);
+    }
+
+    // Glassy bell when a drop pinches off — slightly lower-pitched bell tone
+    function playBellAt(freq, vol) {
+      if (!audioReady()) return;
+      const t = actx.currentTime;
+      const o = actx.createOscillator();
+      const m = actx.createOscillator(); // FM modulator for bell tone
+      const mg = actx.createGain(); mg.gain.value = freq * 0.5;
+      const g = actx.createGain();
+      m.frequency.value = freq * 2.01;
+      m.connect(mg).connect(o.frequency);
+      o.type = 'sine'; o.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(vol, t + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.95);
+      o.connect(g).connect(masterGain);
+      o.start(t); m.start(t);
+      o.stop(t + 1.0); m.stop(t + 1.0);
+      trackVoice(1000);
+    }
+
+    // Whoosh — bandpassed noise burst, stereo-panned to finger x
+    function playWhoosh(panLR, intensity) {
+      if (!audioReady() || !noiseBuf) return;
+      const t = actx.currentTime;
+      const src = actx.createBufferSource(); src.buffer = noiseBuf; src.loop = false;
+      const bp = actx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 900 + intensity * 1400;
+      bp.Q.value = 1.4;
+      const g = actx.createGain();
+      const peak = 0.025 + intensity * 0.06;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(peak, t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
+      let outNode = g;
+      if (typeof actx.createStereoPanner === 'function') {
+        const pan = actx.createStereoPanner();
+        pan.pan.value = Math.max(-1, Math.min(1, panLR));
+        g.connect(pan).connect(masterGain);
+        outNode = pan;
+      } else {
+        g.connect(masterGain);
+      }
+      src.connect(bp).connect(g);
+      src.start(t);
+      src.stop(t + 0.32);
+      trackVoice(320);
     }
 
     function onFirstTouch() {
@@ -654,6 +832,14 @@
         palAccent[k] = m0.accent[k] * (1 - moodT) + m1.accent[k] * moodT;
       }
 
+      // Per-finger ring spawn (magnetic field visualization)
+      for (const f of fingers.values()) {
+        if (now - f.lastRing > 580) {
+          emitRing(f.x, f.y, palAccent);
+          f.lastRing = now;
+        }
+      }
+
       // Update spikes
       let totalPower = 0;
       for (let i = 0; i < N; i++) {
@@ -685,17 +871,45 @@
         // Tips sit on or above the surface
         if (s.y > baseY) { s.y = baseY; if (s.vy > 0) s.vy = 0; }
 
-        // Spike ping crossing high threshold
+        // Tip-height-tied ping when power crosses high threshold
         if (s.power > 0.62 && s._prevPower <= 0.62 && audioReady()) {
-          playPing(1600 + Math.random() * 1800, 0.12 + Math.random() * 0.08);
+          const tipNorm = Math.max(0, Math.min(1, (baseY - s.y) / (baseY * 0.78)));
+          playPing(pickNote(tipNorm), 0.12 + Math.random() * 0.06);
         }
         s._prevPower = s.power;
+
+        // Sparkle emission — spike near peak height, throttled per spike.
+        s.sparkClk -= dtSec;
+        const tipNorm = Math.max(0, Math.min(1, (baseY - s.y) / (baseY * 0.78)));
+        if (s.power > 0.78 && tipNorm > 0.35 && s.sparkClk <= 0) {
+          // Higher tips spark more often
+          s.sparkClk = 0.08 + (1 - tipNorm) * 0.18;
+          emitSpark(s.x + (Math.random() - 0.5) * 4, s.y, palAccent);
+        }
+
+        // Pinch-off — spike sustained near peak for >3s pinches off a drop.
+        if (s.power > 0.9 && tipNorm > 0.55) {
+          s.sustain += dtSec;
+        } else {
+          s.sustain = Math.max(0, s.sustain - dtSec * 0.6);
+        }
+        if (s.sustain > 3.0) {
+          emitDrop(s.x, s.y - 4, palAccent);
+          // Retract the spike sharply — the pinch consumed some material
+          s.y += 28;
+          s.vy = Math.max(s.vy, 2.0);
+          s.sustain = 0;
+          if (audioReady()) playBellAt(pickNote(Math.min(1, tipNorm + 0.15)) * 0.5, 0.16);
+        }
 
         spikeBuf[i * 2]     = s.x * DPR;
         spikeBuf[i * 2 + 1] = s.y * DPR;
         powerData[i]         = s.power;
         totalPower += s.power;
       }
+
+      // Audio mood mix follows the visual palette
+      applyMoodToAudio();
 
       // Advance ripples
       for (let i = 0; i < ripples.length; i++) {
@@ -725,6 +939,102 @@
       gl.uniform3fv(U.pAccent, palAccent);
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+      // ─── FX overlay (sparkles + rings + drops) ─────────────────────────────
+      fxCtx.clearRect(0, 0, W, H);
+      fxCtx.globalCompositeOperation = 'lighter';
+
+      // Magnetic field rings — concentric stroke arcs that expand + fade
+      for (let i = rings.length - 1; i >= 0; i--) {
+        const r = rings[i];
+        r.age += dtSec;
+        if (r.age >= r.life) { rings.splice(i, 1); continue; }
+        const t = r.age / r.life;
+        const radius = 14 + r.age * 96;
+        const alpha = (1 - t) * 0.55;
+        const aR = Math.round(r.accent[0] * 255);
+        const aG = Math.round(r.accent[1] * 255);
+        const aB = Math.round(r.accent[2] * 255);
+        fxCtx.beginPath();
+        fxCtx.arc(r.x, r.y, radius, 0, Math.PI * 2);
+        fxCtx.lineWidth = 1.6;
+        fxCtx.strokeStyle = `rgba(${aR},${aG},${aB},${alpha})`;
+        fxCtx.stroke();
+        // Inner halo
+        if (t < 0.3) {
+          fxCtx.beginPath();
+          fxCtx.arc(r.x, r.y, radius * 0.42, 0, Math.PI * 2);
+          fxCtx.fillStyle = `rgba(${aR},${aG},${aB},${(1 - t / 0.3) * 0.10})`;
+          fxCtx.fill();
+        }
+      }
+
+      // Particles — sparks float + fade; drops fall under gravity + splash on land
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.age += dtSec;
+        if (p.type === 'spark') {
+          p.vy += 0.18 * dtN;
+          p.x += p.vx * dtN;
+          p.y += p.vy * dtN;
+          if (p.age >= p.life || p.y > baseY + 2) {
+            particles.splice(i, 1);
+            continue;
+          }
+          const t = p.age / p.life;
+          const alpha = (1 - t) * 0.95;
+          const aR = Math.round(p.accent[0] * 255);
+          const aG = Math.round(p.accent[1] * 255);
+          const aB = Math.round(p.accent[2] * 255);
+          // Soft additive blob
+          const g = fxCtx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.size * 4);
+          g.addColorStop(0,   `rgba(255,255,255,${alpha * 0.95})`);
+          g.addColorStop(0.4, `rgba(${aR},${aG},${aB},${alpha * 0.7})`);
+          g.addColorStop(1,   `rgba(${aR},${aG},${aB},0)`);
+          fxCtx.fillStyle = g;
+          fxCtx.beginPath();
+          fxCtx.arc(p.x, p.y, p.size * 4, 0, Math.PI * 2);
+          fxCtx.fill();
+        } else if (p.type === 'drop') {
+          p.vy += 0.32 * dtN; // heavier gravity
+          p.x += p.vx * dtN;
+          p.y += p.vy * dtN;
+          // Splash when crossing baseline going down
+          if (p.y >= baseY && p.vy > 0) {
+            // Pour 4 mini sparks + spawn a ripple on the pool
+            const aR = Math.round(p.accent[0] * 255);
+            const aG = Math.round(p.accent[1] * 255);
+            const aB = Math.round(p.accent[2] * 255);
+            for (let s = 0; s < 5; s++) {
+              particles.push({
+                type: 'spark',
+                x: p.x + (Math.random() - 0.5) * 8,
+                y: baseY - 2,
+                vx: (Math.random() - 0.5) * 3.5,
+                vy: -0.6 - Math.random() * 1.6,
+                age: 0, life: 0.5 + Math.random() * 0.35,
+                size: 1.0 + Math.random() * 1.2,
+                accent: p.accent,
+              });
+            }
+            spawnRipple(p.x);
+            particles.splice(i, 1);
+            continue;
+          }
+          // Drop visual — small dark pearl with chrome highlight
+          const aR = Math.round(p.accent[0] * 255);
+          const aG = Math.round(p.accent[1] * 255);
+          const aB = Math.round(p.accent[2] * 255);
+          const g = fxCtx.createRadialGradient(p.x - p.size * 0.3, p.y - p.size * 0.3, 0, p.x, p.y, p.size);
+          g.addColorStop(0,   `rgba(255,255,255,0.85)`);
+          g.addColorStop(0.4, `rgba(${aR},${aG},${aB},0.65)`);
+          g.addColorStop(1,   `rgba(${aR},${aG},${aB},0)`);
+          fxCtx.fillStyle = g;
+          fxCtx.beginPath();
+          fxCtx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+          fxCtx.fill();
+        }
+      }
 
       requestAnimationFrame(step);
     }
