@@ -550,8 +550,6 @@
       // Wait one frame so layout + sizing has settled
       await new Promise(r => requestAnimationFrame(r));
       while (!firstTouched) {
-        // Returning visitor — skip the demo
-        if (localStorage.getItem('ferrofluid:played')) return;
         const cycleStart = performance.now();
         const dur = 4400; // ~4.4s per cycle
         const yArc = (t) => H * 0.42 - Math.sin(t * Math.PI) * 26;
@@ -764,16 +762,12 @@
       if (firstTouched) return;
       firstTouched = true;
       hintEl.classList.add('is-gone');
-      try { localStorage.setItem('ferrofluid:played', '1'); } catch (_) {}
       initAudio();
     }
-
-    // Returning visitors don't need the hint — fade it before they touch.
-    try {
-      if (localStorage.getItem('ferrofluid:played')) {
-        hintEl.classList.add('is-gone');
-      }
-    } catch (_) {}
+    // The demo runs EVERY session — on Aigram's TikTok-style list a user may
+    // scroll past dozens of games per session and forget which is which. The
+    // intro doubles as a visual attractor that signals "this thing moves if
+    // you touch it". (firstTouched is in-memory only.)
 
     // ─── Main loop ────────────────────────────────────────────────────────────
     const powerData  = new Float32Array(N);
